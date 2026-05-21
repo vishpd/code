@@ -4,8 +4,10 @@ For each configured NSE sectoral index (Nifty Pharma, Nifty Auto, ...) the
 script:
   1. Auto-discovers the index constituents (downloads NSE's published CSV,
      falling back to a hardcoded list if the download fails).
-  2. Fetches daily historical close prices for each stock via Kite Connect.
-  3. Computes a correlation matrix from daily returns.
+  2. Fetches historical close prices for each stock via Kite Connect, in
+     chunks that respect the API's per-request date-range limits. Daily and
+     intraday intervals are both supported.
+  3. Computes a correlation matrix from returns (not raw price levels).
   4. Saves the matrix as a CSV and a heatmap PNG (one pair per index).
 
 Credentials are read from a `.env` file. The Kite access token expires daily,
@@ -17,13 +19,12 @@ import io
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 
 import matplotlib
 
 matplotlib.use("Agg")  # headless-safe backend; we save PNGs instead of showing
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv, set_key
@@ -35,14 +36,36 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------
-# Configuration
+# Configuration  --  edit these
 # --------------------------------------------------------------------------
 
 ENV_PATH = ".env"
 OUTPUT_DIR = "output"
-HISTORY_DAYS = 365            # how far back to pull daily candles
-INTERVAL = "day"              # Kite historical-data interval
-RATE_LIMIT_SLEEP = 0.35       # seconds between historical-data calls (~3 req/s)
+
+# Date range for historical data (format: YYYY-MM-DD).
+START_DATE = "2024-05-21"
+END_DATE = "2025-05-21"
+
+# Candle interval. One of Kite Connect's supported values:
+#   minute, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute, day
+INTERVAL = "day"
+
+RATE_LIMIT_SLEEP = 0.35  # seconds between historical-data calls (~3 req/s)
+
+# Kite caps the date span of a single historical-data request, and the cap
+# depends on the interval. Wider ranges are fetched in chunks no larger than
+# the value below. (Daily candles are already within trading hours, so no
+# trading-hours filtering is needed.)
+MAX_DAYS_PER_REQUEST = {
+    "minute": 60,
+    "3minute": 100,
+    "5minute": 100,
+    "10minute": 100,
+    "15minute": 200,
+    "30minute": 200,
+    "60minute": 400,
+    "day": 2000,
+}
 
 # A browser-like User-Agent: niftyindices.com rejects bare programmatic clients.
 HTTP_HEADERS = {
@@ -163,27 +186,48 @@ def fetch_constituents(index_name, cfg):
 # --------------------------------------------------------------------------
 
 def build_token_map(kite):
-    """Map NSE tradingsymbol -> instrument_token (needed for historical data)."""
+    """Map NSE tradingsymbol -> instrument_token (needed for historical data).
+
+    Fetched once for the whole run so per-symbol lookups cost no API calls.
+    """
     instruments = kite.instruments("NSE")
     return {inst["tradingsymbol"]: inst["instrument_token"] for inst in instruments}
 
 
 def fetch_close_series(kite, token, symbol, from_date, to_date):
-    """Return a pandas Series of daily close prices for one instrument."""
-    candles = kite.historical_data(token, from_date, to_date, INTERVAL)
-    if not candles:
+    """Return a pandas Series of close prices for one instrument.
+
+    Kite limits the date span of a single historical-data request, so wide
+    ranges are split into chunks no larger than MAX_DAYS_PER_REQUEST[INTERVAL].
+    """
+    max_days = MAX_DAYS_PER_REQUEST[INTERVAL]
+    chunks = []
+    current = from_date
+    while current <= to_date:
+        chunk_end = min(current + timedelta(days=max_days - 1), to_date)
+        candles = kite.historical_data(
+            token,
+            current.strftime("%Y-%m-%d"),
+            chunk_end.strftime("%Y-%m-%d"),
+            INTERVAL,
+        )
+        if candles:
+            frame = pd.DataFrame(candles)
+            chunks.append(frame.set_index("date")["close"])
+        current = chunk_end + timedelta(days=1)
+        time.sleep(RATE_LIMIT_SLEEP)  # respect Kite's rate limit
+
+    if not chunks:
         return None
-    df = pd.DataFrame(candles)
-    series = df.set_index("date")["close"]
+    series = pd.concat(chunks)
+    series = series[~series.index.duplicated(keep="last")]  # drop chunk overlaps
+    series.sort_index(inplace=True)
     series.name = symbol
     return series
 
 
-def collect_close_prices(kite, symbols, token_map):
+def collect_close_prices(kite, symbols, token_map, from_date, to_date):
     """Fetch close-price series for every symbol and return them as a DataFrame."""
-    to_date = date.today()
-    from_date = to_date - timedelta(days=HISTORY_DAYS)
-
     series_list = []
     for symbol in symbols:
         token = token_map.get(symbol)
@@ -199,7 +243,6 @@ def collect_close_prices(kite, symbols, token_map):
             print(f"  fetched {symbol}: {len(series)} candles.")
         except Exception as exc:
             print(f"  skip {symbol}: historical-data error ({exc}).")
-        time.sleep(RATE_LIMIT_SLEEP)  # respect Kite's rate limit
 
     if not series_list:
         return pd.DataFrame()
@@ -211,7 +254,7 @@ def collect_close_prices(kite, symbols, token_map):
 # --------------------------------------------------------------------------
 
 def build_correlation(close_df):
-    """Correlation matrix of daily returns.
+    """Correlation matrix of returns.
 
     Returns (not raw price levels) are used because price series are
     non-stationary and trending, which inflates apparent correlation.
@@ -250,7 +293,23 @@ def plot_heatmap(corr, title, out_path):
 # Main
 # --------------------------------------------------------------------------
 
+def parse_dates():
+    """Validate and parse the configured date range."""
+    try:
+        start = datetime.strptime(START_DATE, "%Y-%m-%d").date()
+        end = datetime.strptime(END_DATE, "%Y-%m-%d").date()
+    except ValueError:
+        sys.exit("START_DATE / END_DATE must be in YYYY-MM-DD format.")
+    if start >= end:
+        sys.exit("START_DATE must be earlier than END_DATE.")
+    return start, end
+
+
 def main():
+    if INTERVAL not in MAX_DAYS_PER_REQUEST:
+        sys.exit(f"INTERVAL must be one of: {', '.join(MAX_DAYS_PER_REQUEST)}")
+    from_date, to_date = parse_dates()
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     kite = get_kite()
@@ -261,19 +320,31 @@ def main():
         print(f"\n=== {index_name} ===")
         symbols = fetch_constituents(index_name, cfg)
 
-        close_df = collect_close_prices(kite, symbols, token_map)
+        close_df = collect_close_prices(kite, symbols, token_map, from_date, to_date)
         if close_df.empty or close_df.shape[1] < 2:
             print(f"{index_name}: not enough data to build a correlation matrix.")
             continue
 
         corr = build_correlation(close_df)
+        if len(close_df) < 100:
+            print(
+                f"  warning: only {len(close_df)} data points - correlation "
+                "may be unreliable; widen the date range or use a finer interval."
+            )
 
         slug = index_name.replace(" ", "_")
-        csv_path = os.path.join(OUTPUT_DIR, f"{slug}_correlation.csv")
-        png_path = os.path.join(OUTPUT_DIR, f"{slug}_correlation_heatmap.png")
+        csv_path = os.path.join(OUTPUT_DIR, f"{slug}_correlation_{INTERVAL}.csv")
+        png_path = os.path.join(
+            OUTPUT_DIR, f"{slug}_correlation_{INTERVAL}_heatmap.png"
+        )
 
         corr.to_csv(csv_path)
-        plot_heatmap(corr, f"{index_name} - Daily Return Correlation", png_path)
+        plot_heatmap(
+            corr,
+            f"{index_name} - Return Correlation "
+            f"({INTERVAL}, {START_DATE} to {END_DATE})",
+            png_path,
+        )
 
         print(f"{index_name}: {corr.shape[0]} stocks correlated.")
         print(f"  saved {csv_path}")
