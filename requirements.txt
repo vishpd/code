@@ -1,0 +1,6 @@
+kiteconnect
+pandas
+numpy
+matplotlib
+requests
+python-dotenv
